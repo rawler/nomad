@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -102,6 +103,9 @@ const (
 
 	// dockerImageResKey is the CreatedResources key for docker images
 	dockerImageResKey = "image"
+
+	// Authentication-helper is a binary in $PATH named ${prefix-}${docker.auth.helper}
+	dockerAuthHelperPrefix = "docker-credential-"
 )
 
 type DockerDriver struct {
@@ -976,31 +980,32 @@ func (d *DockerDriver) createImage(driverConfig *DockerDriverConfig, client *doc
 
 // pullImage creates an image by pulling it from a docker registry
 func (d *DockerDriver) pullImage(driverConfig *DockerDriverConfig, client *docker.Client, repo, tag string) (id string, err error) {
-	var authOptions *docker.AuthConfiguration
-	if len(driverConfig.Auth) != 0 {
-		authOptions = &docker.AuthConfiguration{
-			Username:      driverConfig.Auth[0].Username,
-			Password:      driverConfig.Auth[0].Password,
-			Email:         driverConfig.Auth[0].Email,
-			ServerAddress: driverConfig.Auth[0].ServerAddress,
-		}
-	} else if authConfigFile := d.config.Read("docker.auth.config"); authConfigFile != "" {
-		var err error
-		authOptions, err = authOptionFrom(authConfigFile, repo)
-		if err != nil {
-			d.logger.Printf("[INFO] driver.docker: failed to find docker auth for repo %q: %v", repo, err)
-			return "", fmt.Errorf("Failed to find docker auth for repo %q: %v", repo, err)
-		}
+	authOptions, err := d.resolveAuthentication(driverConfig, repo)
+	if err != nil {
+		return "", fmt.Errorf("Failed to find docker auth for repo %q: %v", repo, err)
+	}
 
-		if authOptions.Email == "" && authOptions.Password == "" &&
-			authOptions.ServerAddress == "" && authOptions.Username == "" {
-			d.logger.Printf("[DEBUG] driver.docker: did not find docker auth for repo %q", repo)
-		}
+	if configIsEmpty(authOptions) {
+		d.logger.Printf("[DEBUG] driver.docker: did not find docker auth for repo %q", repo)
 	}
 
 	d.emitEvent("Downloading image %s:%s", repo, tag)
 	coordinator, callerID := d.getDockerCoordinator(client)
 	return coordinator.PullImage(driverConfig.ImageName, authOptions, callerID)
+}
+
+func (d *DockerDriver) resolveAuthentication(driverConfig *DockerDriverConfig, repo string) (*docker.AuthConfiguration, error) {
+	if len(driverConfig.Auth) != 0 {
+		d.logger.Printf("[DEBUG] driver.docker: using task-given credentials for repo %q", repo)
+		return authOptionFromDriverConfig(driverConfig.Auth[0])
+	} else if authConfigHelper := d.config.Read("docker.auth.helper"); authConfigHelper != "" {
+		d.logger.Printf("[DEBUG] driver.docker: using credentials helper for repo %q", repo)
+		return authOptionFromHelper(authConfigHelper, repo, d.DriverContext.config)
+	} else if authConfigFile := d.config.Read("docker.auth.config"); authConfigFile != "" {
+		d.logger.Printf("[DEBUG] driver.docker: using file-given credentials for repo %q", repo)
+		return authOptionFromFile(authConfigFile, repo)
+	}
+	return nil, nil
 }
 
 // loadImage creates an image by loading it from the file system
@@ -1407,10 +1412,48 @@ func calculatePercent(newSample, oldSample, newTotal, oldTotal uint64, cores int
 	return (float64(numerator) / float64(denom)) * float64(cores) * 100.0
 }
 
+func authOptionFromDriverConfig(auth DockerDriverAuth) (*docker.AuthConfiguration, error) {
+	return &docker.AuthConfiguration{
+		Username:      auth.Username,
+		Password:      auth.Password,
+		Email:         auth.Email,
+		ServerAddress: auth.ServerAddress,
+	}, nil
+}
+
+func authOptionFromHelper(helperName, repoName string, clientConfig *config.Config) (*docker.AuthConfiguration, error) {
+	helper := dockerAuthHelperPrefix + helperName
+	cmd := exec.Command(helper, "get")
+	cmd.Stdin = strings.NewReader(repoName)
+
+	// For helper to be able to read credentials from vault
+	cmd.Env = append(os.Environ(), fmt.Sprintf("VAULT_TOKEN=%s", clientConfig.VaultConfig.Token))
+
+	output, err := cmd.Output()
+	if err != nil {
+		switch e := err.(type) {
+		default:
+			return nil, err
+		case *exec.ExitError:
+			return nil, fmt.Errorf("%s failed with stderr: %s", helper, string(e.Stderr))
+		}
+	}
+
+	var response map[string]string
+	if err := json.Unmarshal(output, &response); err != nil {
+		return nil, err
+	}
+
+	return &docker.AuthConfiguration{
+		Username: response["Username"],
+		Password: response["Secret"],
+	}, nil
+}
+
 // authOptionFrom takes the Docker auth config file and the repo being pulled
 // and returns an AuthConfiguration or an error if the file/repo could not be
 // parsed or looked up.
-func authOptionFrom(file, repo string) (*docker.AuthConfiguration, error) {
+func authOptionFromFile(file, repo string) (*docker.AuthConfiguration, error) {
 	name, err := reference.ParseNamed(repo)
 	if err != nil {
 		return nil, fmt.Errorf("Failed to parse named repo %q: %v", repo, err)
@@ -1443,4 +1486,14 @@ func authOptionFrom(file, repo string) (*docker.AuthConfiguration, error) {
 	}
 
 	return apiAuthConfig, nil
+}
+
+func configIsEmpty(auth *docker.AuthConfiguration) bool {
+	if auth == nil {
+		return false
+	}
+	return auth.Username == "" &&
+		auth.Password == "" &&
+		auth.Email == "" &&
+		auth.ServerAddress == ""
 }

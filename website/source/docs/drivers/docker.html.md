@@ -237,9 +237,13 @@ This is not configurable.
 ### Authentication
 
 If you want to pull from a private repo (for example on dockerhub or quay.io),
-you will need to specify credentials in your job via the `auth` option or by
-storing the credentials in a file and setting the
-[docker.auth.config](#auth_file) value on the client.
+you will need to specify credentials in your job via:
+
+ * the `auth` option
+
+ * by storing the credentials in a file and setting the [docker.auth.config](#auth_file) value on the client.
+
+ * by setting `docker.auth.helper` in the client to a [credsStore](https://docs.docker.com/engine/reference/commandline/login/#credential-helper-protocol) helper on $PATH 
 
 The `auth` object supports the following keys:
 
